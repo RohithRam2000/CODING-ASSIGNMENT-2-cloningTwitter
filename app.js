@@ -4,7 +4,7 @@ const { open } = require("sqlite");
 const sqlite3 = require("sqlite3");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const format = require("date-fns/format");
+//const format = require("date-fns/format");
 
 const app = express();
 app.use(express.json());
@@ -36,12 +36,12 @@ const authencatUser = async (request, response, next) => {
     jwtToken = authHeader.split(" ")[1];
   }
   if (jwtToken === undefined) {
-    response.status(400);
+    response.status(401);
     response.send("Invalid JWT Token");
   } else {
     jwt.verify(jwtToken, "MY_SECRET_TOKEN", (error, payload) => {
       if (error) {
-        response.status(400);
+        response.status(401);
         response.send("Invalid JWT Token");
       } else {
         request.username = payload.username;
@@ -158,14 +158,15 @@ app.get("/tweets/:tweetId/", authencatUser, async (request, response) => {
   let idsToCheck = idsList.join(",");
   const tweetQuery = `SELECT
   tweet.tweet,
-  COUNT(like.like_id) AS likes,
-  COUNT(reply.reply_id) AS replies,
+  (SELECT COUNT(like_id) FROM like WHERE tweet_id = tweet.tweet_id) AS likes,
+  (SELECT COUNT(reply_id) FROM reply WHERE tweet_id = tweet.tweet_id) AS replies,
   tweet.date_time AS dateTime
-  FROM (tweet INNER JOIN like ON tweet.tweet_id = like.tweet_id) AS T
-  INNER JOIN reply ON T.tweet_id = reply.tweet_id
-  WHERE tweet.user_id IN (${idsToCheck}) AND tweet.tweet_id = ${tweetId}`;
+  FROM (tweet LEFT JOIN like ON tweet.tweet_id = like.tweet_id) AS T
+  LEFT JOIN reply ON T.tweet_id = reply.tweet_id
+  WHERE tweet.user_id IN (${idsToCheck}) AND tweet.tweet_id = ${tweetId}
+  GROUP BY tweet.tweet_id`;
   const tweetQueryResult = await db.get(tweetQuery);
-  if (tweetQueryResult.tweet === null) {
+  if (tweetQueryResult === undefined) {
     response.status(401);
     response.send("Invalid Request");
   } else {
@@ -187,27 +188,18 @@ app.get("/tweets/:tweetId/likes/", authencatUser, async (request, response) => {
   }
   let idsToCheck = idsList.join(",");
   const tweetQuery = `SELECT
-  like.user_id AS id
-  FROM (tweet INNER JOIN like ON tweet.tweet_id = like.tweet_id) AS T
-  INNER JOIN user ON T.user_id = user.user_id
-  WHERE tweet.user_id IN (${idsToCheck}) AND tweet.tweet_id = ${tweetId}`;
+  (SELECT name FROM user WHERE user_id = like.user_id) AS name
+  FROM tweet LEFT JOIN like ON tweet.tweet_id = like.tweet_id
+  WHERE tweet.user_id IN (${idsToCheck}) AND tweet.tweet_id = ${tweetId}
+  GROUP BY like.like_id`;
   const tweetQueryResult = await db.all(tweetQuery);
   if (tweetQueryResult.length === 0) {
     response.status(401);
     response.send("Invalid Request");
   } else {
-    let likesId = [];
-    for (let obj of tweetQueryResult) {
-      likesId.push(obj.id);
-    }
-    likesId.sort();
-    let likesIdCheck = likesId.join(",");
-    const userNameQuery = `SELECT name FROM user WHERE user_id IN(${likesIdCheck});`;
-    const userNameQueryResult = await db.all(userNameQuery);
-
-    let likes = [];
-    for (let obj of userNameQueryResult) {
-      likes.push(obj.name);
+    const likes = [];
+    for (let i of tweetQueryResult) {
+      likes.push(i.name);
     }
     response.send({ likes });
   }
@@ -253,12 +245,13 @@ app.get("/user/tweets/", authencatUser, async (request, response) => {
   const dbUser = await db.get(checkUserDbQuery);
   const tweetsQuery = `SELECT 
   tweet.tweet AS tweet,
-  COUNT(like.like_id) AS likes,
-  COUNT(reply.reply_id) AS replies,
+  (SELECT COUNT(like_id) FROM like WHERE tweet_id = tweet.tweet_id) AS likes,
+  (SELECT COUNT(reply_id) FROM reply WHERE tweet_id = tweet.tweet_id) AS replies,
   tweet.date_time AS dateTime
-  FROM (tweet INNER JOIN like ON tweet.tweet_id = like.tweet_id) AS T
-  INNER JOIN reply ON T.tweet_id = reply.tweet_id
-  WHERE tweet.user_id = ${dbUser.user_id};`;
+  FROM (tweet LEFT JOIN like ON tweet.tweet_id = like.tweet_id) AS T
+  LEFT JOIN reply ON T.tweet_id = reply.tweet_id
+  WHERE tweet.user_id = ${dbUser.user_id}
+  GROUP BY tweet.tweet_id;`;
   const tweetsQueryResult = await db.all(tweetsQuery);
   response.send(tweetsQueryResult);
 });
@@ -269,7 +262,7 @@ app.post("/user/tweets/", authencatUser, async (request, response) => {
   const { username } = request;
   const checkUserDbQuery = `SELECT * FROM user WHERE username = '${username}';`;
   const dbUser = await db.get(checkUserDbQuery);
-  const dateTime = format(new Date(), "yyyy-MM-dd hh:mm:ss");
+  const dateTime = new Date();
   const postTweet = `INSERT INTO tweet (tweet, user_id, date_time)
   VALUES ('${tweet}', ${dbUser.user_id}, '${dateTime}');`;
   const postTweetResult = await db.run(postTweet);
@@ -280,20 +273,25 @@ app.post("/user/tweets/", authencatUser, async (request, response) => {
 app.delete("/tweets/:tweetId/", authencatUser, async (request, response) => {
   const { tweetId } = request.params;
   const { username } = request;
-  const checkUserDbQuery = `SELECT * FROM user WHERE username = '${username}';`;
-  const dbUser = await db.get(checkUserDbQuery);
-  const tweetsDetails = `SELECT tweet_id FROM tweet WHERE user_id = ${dbUser.user_id};`;
-  const tweetsDetailsResult = await db.all(tweetsDetails);
-  const tweetsIds = [];
-  for (let item of tweetsDetailsResult) {
-    tweetsIds.push(item.tweet_id);
-  }
-  const tweetIdCheck = tweetsIds.includes(tweetId);
-  if (tweetIdCheck === true) {
-    const dbQuery = `DELETE FROM tweet WHERE tweet_id = ${tweetId};`;
-    await db.run(dbQuery);
+  try {
+    const checkUserDbQuery = `SELECT * FROM user WHERE username = '${username}';`;
+    const dbUser = await db.get(checkUserDbQuery);
+    const tweetsDetails = `SELECT * FROM tweet WHERE user_id = ${dbUser.user_id};`;
+    const tweetsDetailsResult = await db.all(tweetsDetails);
+    const tweetsIds = [];
+    for (let item of tweetsDetailsResult) {
+      tweetsIds.push(item.tweet_id);
+    }
+    const idCheck = tweetsIds.join(",");
+    const dbQuery = `DELETE FROM tweet WHERE tweet_id IN (${idCheck}) AND tweet_id = ${tweetId};`;
+    const dbQueryResult = await db.run(dbQuery);
+    if (dbQueryResult.Statement === undefined) {
+      response.status(401);
+      response.send("Invalid Request");
+      return;
+    }
     response.send("Tweet Removed");
-  } else {
+  } catch (e) {
     response.status(401);
     response.send("Invalid Request");
   }
